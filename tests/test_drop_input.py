@@ -6,8 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from bdmv2mkv_gui import App
-from drop_input import file_from_drop
+from ffmpeg_bdrip.drop import file_from_drop
+from ffmpeg_bdrip.gui import App
 
 
 class Variable:

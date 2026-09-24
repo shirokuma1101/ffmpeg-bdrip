@@ -7,8 +7,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from bdmv2mkv import build_parser, find_tool, make_command
-from conversion_progress import estimate_remaining, gui_command, output_duration, parse_out_time
+from ffmpeg_bdrip.cli import build_parser, find_tool, make_command
+from ffmpeg_bdrip.progress import estimate_remaining, gui_command, output_duration, parse_out_time
 
 
 class ConversionProgressTests(unittest.TestCase):

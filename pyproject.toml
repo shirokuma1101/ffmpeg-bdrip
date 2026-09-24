@@ -10,8 +10,8 @@ requires-python = ">=3.10"
 dependencies = ["tkinterdnd2>=0.6.3,<0.7"]
 
 [project.scripts]
-ffmpeg-bdrip = "bdmv2mkv:main"
-ffmpeg-bdrip-gui = "bdmv2mkv_gui:main"
+ffmpeg-bdrip = "ffmpeg_bdrip.cli:main"
+ffmpeg-bdrip-gui = "ffmpeg_bdrip.gui:main"
 
-[tool.setuptools]
-py-modules = ["bdmv2mkv", "bdmv2mkv_gui", "presets", "media_probe", "drop_input", "conversion_progress"]
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -84,3 +84,26 @@ python .\bdmv2mkv.py .\00000.m2ts --dry-run
 入力ファイルのタイムスタンプが途中から始まる場合も、出力MKVの先頭時刻は0へ揃えます。過去に作成したMKVが途中の時刻から再生される場合は、そのMKVを入力にして別名のMKVへ再変換してください（映像・音声をコピーする設定なら再エンコードしません）。
 
 `--audio-count N`を指定すると、入力側の音声ストリームを先頭から最大N本に制限できます。指定しない場合は全音声を含めます。`--audio-map`を使う場合は、指定した音声マップの先頭N本が対象になります。
+
+## 開発用の構成
+
+```text
+src/ffmpeg_bdrip/
+  cli.py       CLIとFFmpegコマンド生成
+  gui.py       Tkinter GUI
+  probe.py     ffprobeによるメディア解析
+  progress.py  進捗・ETA計算
+  presets.py   プリセットの保存と読み込み
+  drop.py      ドラッグ＆ドロップ入力
+tests/         自動テスト
+vendor/        同梱FFmpegとGUI依存ファイル
+```
+
+ルートの `bdmv2mkv.py` と `bdmv2mkv_gui.py` は従来の起動方法を維持するための互換ランチャーです。新しい機能は `src/ffmpeg_bdrip/` 内の責務に応じたモジュールへ追加してください。
+
+テストは開発用インストール後に次のように実行できます。
+
+```powershell
+python -m pip install -e .
+python -m unittest discover -s tests -v
+```

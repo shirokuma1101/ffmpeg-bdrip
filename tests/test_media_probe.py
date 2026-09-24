@@ -7,8 +7,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from bdmv2mkv import find_tool
-from media_probe import describe_stream, format_duration, iter_media_files, probe_media, stream_counts
+from ffmpeg_bdrip.cli import find_tool
+from ffmpeg_bdrip.probe import describe_stream, format_duration, iter_media_files, probe_media, stream_counts
 
 
 class MediaProbeTests(unittest.TestCase):

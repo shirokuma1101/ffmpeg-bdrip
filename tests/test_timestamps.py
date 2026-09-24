@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from bdmv2mkv import build_parser, find_tool, make_command
+from ffmpeg_bdrip.cli import build_parser, find_tool, make_command
 
 
 class TimestampTests(unittest.TestCase):

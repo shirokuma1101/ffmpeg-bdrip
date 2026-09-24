@@ -8,8 +8,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from bdmv2mkv_gui import App
-from presets import NEW_DEFAULT_NAME, default_presets, load_presets, save_presets
+from ffmpeg_bdrip.gui import App
+from ffmpeg_bdrip.presets import NEW_DEFAULT_NAME, default_presets, load_presets, save_presets
 
 
 class Variable:
