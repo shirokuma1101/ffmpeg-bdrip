@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ffmpeg-bdrip"
+version = "0.1.0"
+description = "Lossless remuxer for BDMV-derived TS files"
+requires-python = ">=3.10"
+dependencies = ["tkinterdnd2>=0.6.3,<0.7"]
+
+[project.scripts]
+ffmpeg-bdrip = "bdmv2mkv:main"
+ffmpeg-bdrip-gui = "bdmv2mkv_gui:main"
+
+[tool.setuptools]
+py-modules = ["bdmv2mkv", "bdmv2mkv_gui", "presets", "media_probe", "drop_input", "conversion_progress"]
