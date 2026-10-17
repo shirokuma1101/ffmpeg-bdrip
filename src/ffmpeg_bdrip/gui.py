@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import copy
 import queue
 import subprocess
 import sys
@@ -12,10 +13,11 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from .cli import default_output, find_tool, make_command
-from .drop import file_from_drop
+from .batch import batch_targets, resolve_streams, stream_ordinals
+from .drop import files_from_drop
 from .presets import load_presets, save_presets
 from .probe import describe_stream, format_duration, iter_media_files, probe_media, stream_counts
-from .progress import estimate_remaining, format_time, gui_command, output_duration, parse_out_time
+from .progress import batch_percent, estimate_remaining, format_time, gui_command, output_duration, parse_out_time
 
 bundled_dnd = Path(__file__).resolve().parents[2] / "vendor" / "python"
 if sys.platform == "win32" and (bundled_dnd / "tkinterdnd2").is_dir():
@@ -34,13 +36,20 @@ class App(RootWindow):
     def __init__(self) -> None:
         super().__init__()
         self.title("ffmpeg-bdrip")
-        self.minsize(760, 710)
+        self.minsize(1180, 650)
         self.process: subprocess.Popen[str] | None = None
         self.process_output: queue.Queue[str | None] = queue.Queue()
         self.progress_total: float | None = None
         self.progress_time = 0.0
         self.progress_speed = ""
         self.cancel_requested = False
+        self.batch_paths: list[Path] = []
+        self.batch_active = False
+        self.batch_position = ""
+        self.batch_durations: list[float | None] = []
+        self.batch_finished = 0
+        self.batch_cancel = threading.Event()
+        self.batch_events: queue.Queue[tuple] = queue.Queue()
         self.vars: dict[str, tk.Variable] = {}
         self.probe_results: queue.Queue[tuple[int, Path, dict | Exception]] = queue.Queue()
         self.probe_generation = 0
@@ -68,29 +77,74 @@ class App(RootWindow):
         return self.vars[name]
 
     def _build(self) -> None:
+        menu_bar = tk.Menu(self)
+        tools_menu = tk.Menu(menu_bar, tearoff=False)
+        tools_menu.add_command(label="フォルダ内のファイル一覧・解析結果…", command=self.open_folder_probe)
+        menu_bar.add_cascade(label="ツール", menu=tools_menu)
+        self.configure(menu=menu_bar)
+
         root = ttk.Frame(self, padding=12)
         root.pack(fill="both", expand=True)
-        root.columnconfigure(1, weight=1)
+        root.columnconfigure(0, weight=1, uniform="panes")
+        root.columnconfigure(1, weight=1, uniform="panes")
+        root.rowconfigure(0, weight=1)
+        left = ttk.LabelFrame(root, text="入力・ファイル", padding=8)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        left.columnconfigure(1, weight=1)
+        right = ttk.LabelFrame(root, text="変換設定", padding=8)
+        right.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        right.columnconfigure(1, weight=1)
         row = 0
 
-        ttk.Label(root, text="入力ファイル").grid(row=row, column=0, sticky="w", pady=4)
-        self.input_entry = ttk.Entry(root, textvariable=self.var("input"))
+        ttk.Label(left, text="入力ファイル").grid(row=row, column=0, sticky="w", pady=4)
+        self.input_entry = ttk.Entry(left, textvariable=self.var("input"))
         self.input_entry.grid(row=row, column=1, sticky="ew", pady=4)
-        input_buttons = ttk.Frame(root)
-        input_buttons.grid(row=row, column=2, padx=(6, 0))
-        ttk.Button(input_buttons, text="ファイル…", command=self.choose_input).pack(side="left")
-        ttk.Button(input_buttons, text="フォルダ一覧…", command=self.open_folder_probe).pack(side="left", padx=(6, 0))
+        ttk.Button(left, text="選択…", command=self.choose_input).grid(row=row, column=2, padx=(6, 0))
         row += 1
-        self.drop_hint = ttk.Label(root, text="入力ファイルをここへドラッグ＆ドロップできます。")
+        self.drop_hint = ttk.Label(left, text="入力ファイルをここへドラッグ＆ドロップできます。")
         self.drop_hint.grid(row=row, column=1, columnspan=2, sticky="w")
         self.enable_input_drop()
         row += 1
-        ttk.Label(root, text="出力MKV").grid(row=row, column=0, sticky="w", pady=4)
-        ttk.Entry(root, textvariable=self.var("output")).grid(row=row, column=1, sticky="ew", pady=4)
-        ttk.Button(root, text="保存先…", command=self.choose_output).grid(row=row, column=2, padx=(6, 0))
+        batch = ttk.LabelFrame(left, text="バッチ処理（順番に変換）", padding=6)
+        batch.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(3, 4))
+        batch.columnconfigure(0, weight=1)
+        self.batch_list = tk.Listbox(batch, height=3, selectmode="extended")
+        self.batch_list.grid(row=0, column=0, sticky="ew")
+        batch_buttons = ttk.Frame(batch)
+        batch_buttons.grid(row=0, column=1, padx=(6, 0), sticky="n")
+        ttk.Button(batch_buttons, text="複数追加…", command=self.add_batch_files).pack(fill="x")
+        ttk.Button(batch_buttons, text="現在の入力を追加", command=self.add_current_to_batch).pack(fill="x", pady=3)
+        ttk.Button(batch_buttons, text="選択を削除", command=self.remove_batch_files).pack(fill="x")
+        ttk.Button(batch_buttons, text="全件削除", command=self.clear_batch_files).pack(fill="x", pady=(3, 0))
+        ttk.Label(batch, text="出力フォルダ（空欄なら入力と同じ場所）").grid(row=1, column=0, sticky="w", pady=(5, 0))
+        ttk.Entry(batch, textvariable=self.var("batch_output_folder")).grid(row=2, column=0, sticky="ew")
+        ttk.Button(batch, text="フォルダ…", command=self.choose_batch_output_folder).grid(row=2, column=1, padx=(6, 0), sticky="ew")
+        row += 1
+        ttk.Label(left, text="出力MKV").grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Entry(left, textvariable=self.var("output")).grid(row=row, column=1, sticky="ew", pady=4)
+        ttk.Button(left, text="保存先…", command=self.choose_output).grid(row=row, column=2, padx=(6, 0))
         row += 1
 
-        presets = ttk.LabelFrame(root, text="プリセット", padding=8)
+        streams = ttk.LabelFrame(left, text="入力ファイルの解析・ストリーム選択", padding=8)
+        streams.grid(row=row, column=0, columnspan=3, sticky="nsew", pady=(8, 4))
+        left.rowconfigure(row, weight=1)
+        streams.columnconfigure(0, weight=1)
+        streams.rowconfigure(1, weight=1)
+        self.probe_status = ttk.Label(streams, text="入力ファイルを選ぶとffprobeで解析します。")
+        self.probe_status.grid(row=0, column=0, sticky="w")
+        ttk.Button(streams, text="再解析", command=self.start_probe).grid(row=0, column=1, padx=(8, 0))
+        self.stream_canvas = tk.Canvas(streams, height=170, highlightthickness=0)
+        self.stream_canvas.grid(row=1, column=0, sticky="nsew", pady=(5, 0))
+        scrollbar = ttk.Scrollbar(streams, orient="vertical", command=self.stream_canvas.yview)
+        scrollbar.grid(row=1, column=1, sticky="ns")
+        self.stream_canvas.configure(yscrollcommand=scrollbar.set)
+        self.stream_frame = ttk.Frame(self.stream_canvas)
+        self.stream_window = self.stream_canvas.create_window((0, 0), window=self.stream_frame, anchor="nw")
+        self.stream_frame.bind("<Configure>", lambda _event: self.stream_canvas.configure(scrollregion=self.stream_canvas.bbox("all")))
+        self.stream_canvas.bind("<Configure>", lambda event: self.stream_canvas.itemconfigure(self.stream_window, width=event.width))
+
+        row = 0
+        presets = ttk.LabelFrame(right, text="プリセット", padding=8)
         presets.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(8, 4))
         presets.columnconfigure(0, weight=1)
         self.preset_name = tk.StringVar(self)
@@ -103,24 +157,7 @@ class App(RootWindow):
         ttk.Button(presets, text="削除", command=self.delete_preset).grid(row=0, column=3, padx=(6, 0))
         row += 1
 
-        streams = ttk.LabelFrame(root, text="入力ファイルの解析・ストリーム選択", padding=8)
-        streams.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(8, 4))
-        streams.columnconfigure(0, weight=1)
-        self.probe_status = ttk.Label(streams, text="入力ファイルを選ぶとffprobeで解析します。")
-        self.probe_status.grid(row=0, column=0, sticky="w")
-        ttk.Button(streams, text="再解析", command=self.start_probe).grid(row=0, column=1, padx=(8, 0))
-        self.stream_canvas = tk.Canvas(streams, height=170, highlightthickness=0)
-        self.stream_canvas.grid(row=1, column=0, sticky="ew", pady=(5, 0))
-        scrollbar = ttk.Scrollbar(streams, orient="vertical", command=self.stream_canvas.yview)
-        scrollbar.grid(row=1, column=1, sticky="ns")
-        self.stream_canvas.configure(yscrollcommand=scrollbar.set)
-        self.stream_frame = ttk.Frame(self.stream_canvas)
-        self.stream_window = self.stream_canvas.create_window((0, 0), window=self.stream_frame, anchor="nw")
-        self.stream_frame.bind("<Configure>", lambda _event: self.stream_canvas.configure(scrollregion=self.stream_canvas.bbox("all")))
-        self.stream_canvas.bind("<Configure>", lambda event: self.stream_canvas.itemconfigure(self.stream_window, width=event.width))
-        row += 1
-
-        options = ttk.LabelFrame(root, text="基本設定", padding=8)
+        options = ttk.LabelFrame(right, text="基本設定", padding=8)
         options.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(10, 5))
         for column in range(6):
             options.columnconfigure(column, weight=1 if column in (1, 3, 5) else 0)
@@ -136,7 +173,7 @@ class App(RootWindow):
         ttk.Entry(options, textvariable=self.var("duration"), width=10).grid(row=2, column=5, sticky="w")
         row += 1
 
-        maps = ttk.LabelFrame(root, text="詳細設定：出力順とmapを指定", padding=8)
+        maps = ttk.LabelFrame(right, text="詳細設定：出力順とmapを指定", padding=8)
         maps.grid(row=row, column=0, columnspan=3, sticky="ew", pady=5)
         maps.columnconfigure(1, weight=1)
         self.custom_map_checkbox = ttk.Checkbutton(
@@ -160,7 +197,7 @@ class App(RootWindow):
         self.add_subtitle_map_button.grid(row=3, column=2, sticky="n", padx=(8, 0), pady=(6, 0))
         row += 1
 
-        extra = ttk.LabelFrame(root, text="外部音声（1行1ファイル、省略可）", padding=8)
+        extra = ttk.LabelFrame(right, text="外部音声（1行1ファイル、省略可）", padding=8)
         extra.grid(row=row, column=0, columnspan=3, sticky="ew", pady=5)
         extra.columnconfigure(0, weight=1)
         self.extra_audio = tk.Text(extra, height=2)
@@ -168,8 +205,9 @@ class App(RootWindow):
         ttk.Button(extra, text="追加…", command=self.add_audio).grid(row=0, column=1, padx=(8, 0), sticky="n")
         row += 1
 
+        row = 1
         buttons = ttk.Frame(root)
-        buttons.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(8, 4))
+        buttons.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 4))
         self.run_button = ttk.Button(buttons, text="変換開始", command=self.start)
         self.run_button.pack(side="left")
         self.cancel_button = ttk.Button(buttons, text="キャンセル", command=self.cancel, state="disabled")
@@ -177,16 +215,19 @@ class App(RootWindow):
         ttk.Button(buttons, text="コマンド表示", command=self.show_command).pack(side="left")
         row += 1
         progress = ttk.Frame(root)
-        progress.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(2, 8))
+        progress.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(2, 8))
         progress.columnconfigure(0, weight=1)
         self.progress_bar = ttk.Progressbar(progress, mode="determinate", maximum=100)
         self.progress_bar.grid(row=0, column=0, sticky="ew")
         self.progress_label = ttk.Label(progress, text="待機中", width=72, anchor="e")
         self.progress_label.grid(row=1, column=0, sticky="e", pady=(3, 0))
         row += 1
-        ttk.Label(root, text="ログ").grid(row=row, column=0, sticky="nw")
-        self.log = tk.Text(root, height=12, state="disabled", wrap="none")
-        self.log.grid(row=row, column=1, columnspan=2, sticky="nsew")
+        log_frame = ttk.LabelFrame(root, text="ログ", padding=4)
+        log_frame.grid(row=row, column=0, columnspan=2, sticky="nsew")
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        self.log = tk.Text(log_frame, height=8, state="disabled", wrap="none")
+        self.log.grid(row=0, column=0, sticky="nsew")
         root.rowconfigure(row, weight=1)
 
     def check(self, parent: ttk.Widget, name: str, text: str, row: int, column: int) -> None:
@@ -355,11 +396,54 @@ class App(RootWindow):
 
     def on_input_drop(self, event) -> None:
         try:
-            path = file_from_drop(event.data, self.tk.splitlist)
+            paths = files_from_drop(event.data, self.tk.splitlist)
         except ValueError as exc:
             messagebox.showerror("ドロップエラー", str(exc), parent=self)
             return
-        self.set_input_file(path)
+        if len(paths) == 1:
+            self.set_input_file(paths[0])
+        else:
+            self.queue_batch_files(paths)
+
+    def add_batch_files(self) -> None:
+        paths = filedialog.askopenfilenames(filetypes=[("TS/M2TS/MKV", "*.ts *.m2ts *.mts *.mkv"), ("All files", "*.*")])
+        self.queue_batch_files([Path(path) for path in paths])
+
+    def add_current_to_batch(self) -> None:
+        self.queue_batch_files([Path(self.vars["input"].get().strip()).expanduser()])
+
+    def queue_batch_files(self, paths: list[Path]) -> None:
+        if self.process or self.batch_active:
+            messagebox.showerror("処理中", "処理中はバッチの入力を変更できません。")
+            return
+        if any(not path.is_file() for path in paths):
+            messagebox.showerror("入力エラー", "存在するファイルを選択してください。")
+            return
+        for path in paths:
+            path = path.resolve()
+            if path not in self.batch_paths:
+                self.batch_paths.append(path)
+                self.batch_list.insert("end", str(path))
+        if self.batch_paths and not self.vars["input"].get().strip():
+            self.set_input_file(self.batch_paths[0])
+
+    def remove_batch_files(self) -> None:
+        if self.batch_active:
+            return
+        for index in reversed(self.batch_list.curselection()):
+            del self.batch_paths[index]
+            self.batch_list.delete(index)
+
+    def clear_batch_files(self) -> None:
+        if self.batch_active:
+            return
+        self.batch_paths.clear()
+        self.batch_list.delete(0, "end")
+
+    def choose_batch_output_folder(self) -> None:
+        path = filedialog.askdirectory(parent=self)
+        if path:
+            self.vars["batch_output_folder"].set(path)
 
     def set_input_file(self, path: Path) -> None:
         previous = self.vars["input"].get().strip()
@@ -624,6 +708,9 @@ class App(RootWindow):
             messagebox.showerror("入力エラー", str(exc))
 
     def start(self) -> None:
+        if self.batch_paths:
+            self.start_batch()
+            return
         try:
             command = self.command()
             args = self.namespace()
@@ -666,6 +753,141 @@ class App(RootWindow):
         self.cancel_button.configure(state="normal")
         threading.Thread(target=self.read_process_output, args=(process, self.process_output), daemon=True).start()
         self.after(100, self.poll)
+
+    def start_batch(self) -> None:
+        try:
+            args = self.namespace()
+            folder_text = self.vars["batch_output_folder"].get().strip()
+            targets = batch_targets(self.batch_paths, Path(folder_text) if folder_text else None)
+            ffmpeg = find_tool(args.ffmpeg)
+            if not ffmpeg:
+                raise ValueError("ffmpegが見つかりません。")
+            if args.audio_count is not None and args.audio_count < 0:
+                raise ValueError("音声本数は0以上で指定してください。")
+            if self.pending_preset is not None:
+                raise ValueError("プリセットの解析・適用が完了するまでお待ちください。")
+            selection = None
+            if args.stream_maps is not None and self.probe_data is not None:
+                selection = stream_ordinals(self.probe_data["streams"], args.stream_maps)
+            for source, output in targets:
+                if not source.is_file():
+                    raise ValueError(f"入力ファイルが見つかりません: {source}")
+                if output.exists() and not args.overwrite:
+                    raise ValueError(f"出力ファイルが既に存在します: {output}")
+        except (ValueError, TypeError, KeyError) as exc:
+            messagebox.showerror("バッチ入力エラー", str(exc))
+            return
+        self.batch_cancel.clear()
+        self.batch_events = queue.Queue()
+        self.batch_active = True
+        self.batch_durations = []
+        self.batch_finished = 0
+        self.cancel_requested = False
+        self.run_button.configure(state="disabled")
+        self.cancel_button.configure(state="normal")
+        self.progress_bar.configure(mode="determinate", value=0)
+        self.progress_label.configure(text=f"バッチ: 全{len(targets)}件の長さを解析中…")
+        self.write(f"\nバッチ開始: {len(targets)} 件（出力先は各入力の自動生成名）\n")
+        threading.Thread(target=self.batch_worker, args=(targets, args, ffmpeg, selection), daemon=True).start()
+        self.after(100, self.poll_batch)
+
+    def batch_worker(self, targets, args, ffmpeg: str, selection) -> None:
+        probe_executable = find_tool("ffprobe")
+        completed = failed = 0
+        prepared = []
+        for source, output in targets:
+            if self.batch_cancel.is_set():
+                break
+            try:
+                data = probe_media(source, probe_executable) if probe_executable else None
+                prepared.append((source, output, data, output_duration(data, args), None))
+            except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+                prepared.append((source, output, None, None, str(exc)))
+        if not self.batch_cancel.is_set():
+            self.batch_events.put(("plan", [item[3] for item in prepared]))
+        for number, (source, output, data, duration, probe_error) in enumerate(prepared, 1):
+            if self.batch_cancel.is_set():
+                break
+            try:
+                job_args = copy.copy(args)
+                job_args.input, job_args.output = source, output
+                if selection is not None:
+                    if data is None:
+                        raise ValueError(probe_error or "ストリーム選択の適用にはffprobeが必要です。")
+                    job_args.stream_maps = resolve_streams(data["streams"], selection)
+                else:
+                    job_args.stream_maps = None
+                if self.batch_cancel.is_set():
+                    break
+                command = gui_command(make_command(ffmpeg, job_args, source, output))
+                self.batch_events.put(("start", number, len(targets), source, command, duration))
+                process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                           text=True, encoding="utf-8", errors="replace")
+                self.process = process
+                if process.stdout is not None:
+                    for line in process.stdout:
+                        self.batch_events.put(("line", line))
+                code = process.wait()
+                self.process = None
+                if self.batch_cancel.is_set():
+                    break
+                if code == 0:
+                    completed += 1
+                else:
+                    failed += 1
+                self.batch_events.put(("result", number, source, code))
+            except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+                self.process = None
+                failed += 1
+                self.batch_events.put(("error", number, source, str(exc)))
+        self.batch_events.put(("done", completed, failed, self.batch_cancel.is_set()))
+
+    def poll_batch(self) -> None:
+        for _ in range(500):
+            try:
+                event = self.batch_events.get_nowait()
+            except queue.Empty:
+                break
+            kind = event[0]
+            if kind == "plan":
+                self.batch_durations = event[1]
+                self.progress_bar.configure(mode="determinate", value=0)
+                self.progress_label.configure(text=f"バッチ: 0/{len(self.batch_durations)} 件 ・ 全体 0.0%")
+            elif kind == "start":
+                _, number, total, source, command, duration = event
+                self.progress_total = duration
+                self.progress_time = 0.0
+                self.progress_speed = ""
+                self.progress_bar.configure(mode="determinate", value=batch_percent(self.batch_durations, self.batch_finished))
+                self.write(f"\n[{number}/{total}] {source}\n実行: {subprocess.list2cmdline(command)}\n")
+                self.batch_position = f"[{number}/{total}] "
+                self.update_progress_label()
+            elif kind == "line":
+                self.handle_process_line(event[1])
+            elif kind == "result":
+                _, number, source, code = event
+                self.write(f"[{number}] {source.name}: 終了コード {code}\n")
+                self.batch_finished += 1
+                self.progress_bar.configure(value=batch_percent(self.batch_durations, self.batch_finished))
+            elif kind == "error":
+                _, number, source, error = event
+                self.write(f"[{number}] {source.name}: エラー: {error}\n")
+                self.batch_finished += 1
+                self.progress_bar.configure(value=batch_percent(self.batch_durations, self.batch_finished))
+            elif kind == "done":
+                _, completed, failed, cancelled = event
+                self.batch_active = False
+                self.progress_bar.stop()
+                if not cancelled:
+                    self.progress_bar.configure(value=100)
+                self.run_button.configure(state="normal")
+                self.cancel_button.configure(state="disabled")
+                status = "中止" if cancelled else "完了"
+                self.progress_label.configure(text=f"バッチ{status}: 成功 {completed} 件 / 失敗 {failed} 件")
+                self.write(f"バッチ{status}: 成功 {completed} 件 / 失敗 {failed} 件\n")
+                messagebox.showinfo("バッチ処理", f"{status}: 成功 {completed} 件 / 失敗 {failed} 件")
+                return
+        self.after(100, self.poll_batch)
 
     @staticmethod
     def read_process_output(process: subprocess.Popen[str], output: queue.Queue[str | None]) -> None:
@@ -715,7 +937,9 @@ class App(RootWindow):
             seconds = parse_out_time(value)
             if seconds is not None:
                 self.progress_time = seconds
-                if self.progress_total is not None:
+                if self.batch_active:
+                    self.progress_bar.configure(value=batch_percent(self.batch_durations, self.batch_finished, seconds))
+                elif self.progress_total is not None:
                     self.progress_bar.configure(value=min(100, seconds / self.progress_total * 100))
                 self.update_progress_label()
         elif separator and key == "speed":
@@ -729,17 +953,33 @@ class App(RootWindow):
             self.write(line)
 
     def update_progress_label(self) -> None:
+        prefix = self.batch_position if self.batch_active else ""
         current = format_time(self.progress_time)
         speed = f" ・ {self.progress_speed}" if self.progress_speed and self.progress_speed != "N/A" else ""
         remaining = estimate_remaining(self.progress_total, self.progress_time, self.progress_speed)
         eta = f" ・ ETA {format_time(math.ceil(remaining)) if remaining is not None else '—'}"
         if self.progress_total is None:
-            self.progress_label.configure(text=f"処理済み {current}{speed}{eta}")
+            detail = f"処理済み {current}"
         else:
             percent = min(100, self.progress_time / self.progress_total * 100)
-            self.progress_label.configure(text=f"{percent:.1f}% ・ {current} / {format_time(self.progress_total)}{speed}{eta}")
+            detail = f"{percent:.1f}% ・ {current} / {format_time(self.progress_total)}"
+        if self.batch_active and self.batch_durations:
+            overall = batch_percent(self.batch_durations, self.batch_finished, self.progress_time)
+            detail = f"全体 {overall:.1f}% ・ 現在 {detail}"
+        self.progress_label.configure(text=f"{prefix}{detail}{speed}{eta}")
 
     def cancel(self) -> None:
+        if self.batch_active:
+            if messagebox.askyesno("確認", "バッチ処理を中止しますか？"):
+                self.batch_cancel.set()
+                self.cancel_button.configure(state="disabled")
+                self.progress_label.configure(text="中止中…")
+                if self.process:
+                    try:
+                        self.process.terminate()
+                    except OSError:
+                        pass
+            return
         if self.process and messagebox.askyesno("確認", "変換を中止しますか？"):
             self.cancel_requested = True
             self.cancel_button.configure(state="disabled")

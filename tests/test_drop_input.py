@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ffmpeg_bdrip.drop import file_from_drop
+from ffmpeg_bdrip.drop import file_from_drop, files_from_drop
 from ffmpeg_bdrip.gui import App
 
 
@@ -32,6 +32,8 @@ class DropInputTests(unittest.TestCase):
                 file_from_drop(raw, lambda _data: (str(path), str(path)))
             with self.assertRaisesRegex(ValueError, "ファイルをドロップ"):
                 file_from_drop(raw, lambda _data: (str(Path(folder)),))
+            self.assertEqual(files_from_drop(raw, lambda _data: (str(path), str(path))),
+                             [path.resolve(), path.resolve()])
 
     def test_new_input_updates_only_automatic_output(self):
         old = Path("old.mkv")

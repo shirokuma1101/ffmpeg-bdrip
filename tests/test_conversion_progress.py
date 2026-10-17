@@ -8,10 +8,20 @@ import unittest
 from pathlib import Path
 
 from ffmpeg_bdrip.cli import build_parser, find_tool, make_command
-from ffmpeg_bdrip.progress import estimate_remaining, gui_command, output_duration, parse_out_time
+from ffmpeg_bdrip.progress import batch_percent, estimate_remaining, gui_command, output_duration, parse_out_time
 
 
 class ConversionProgressTests(unittest.TestCase):
+    def test_batch_progress_uses_total_duration(self):
+        self.assertEqual(batch_percent([10, 30], 0, 5), 12.5)
+        self.assertEqual(batch_percent([10, 30], 1, 15), 62.5)
+        self.assertEqual(batch_percent([10, 30], 2), 100)
+
+    def test_batch_progress_falls_back_to_equal_file_weights(self):
+        self.assertEqual(batch_percent([10, None], 0, 5), 25)
+        self.assertEqual(batch_percent([10, None], 1), 50)
+        self.assertEqual(batch_percent([10, None], 2), 100)
+
     def test_eta_uses_remaining_media_time_and_speed(self):
         self.assertEqual(estimate_remaining(120, 30, "2x"), 45)
         self.assertEqual(estimate_remaining(120, 130, "2x"), 0)
