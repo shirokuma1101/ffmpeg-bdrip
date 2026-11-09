@@ -12,9 +12,11 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+from .bdmv_analysis import chapter_positions, collect_text_candidates, duration_text, episode_timeline, quick_scan_bdmv, scan_bdmv, title_playlist_links
 from .cli import default_output, find_tool, make_command
 from .batch import batch_targets, resolve_streams, stream_ordinals
 from .drop import files_from_drop
+from .iso_mount import mount_iso, unmount_iso
 from .presets import load_presets, save_presets
 from .probe import describe_stream, format_duration, iter_media_files, probe_media, stream_counts
 from .progress import batch_percent, estimate_remaining, format_time, gui_command, output_duration, parse_out_time
@@ -80,6 +82,7 @@ class App(RootWindow):
         menu_bar = tk.Menu(self)
         tools_menu = tk.Menu(menu_bar, tearoff=False)
         tools_menu.add_command(label="フォルダ内のファイル一覧・解析結果…", command=self.open_folder_probe)
+        tools_menu.add_command(label="BDMVの構造を解析・表示…", command=self.open_bdmv_analysis)
         menu_bar.add_cascade(label="ツール", menu=tools_menu)
         self.configure(menu=menu_bar)
 
@@ -455,6 +458,9 @@ class App(RootWindow):
 
     def open_folder_probe(self) -> None:
         FolderProbeWindow(self)
+
+    def open_bdmv_analysis(self) -> None:
+        BdmvAnalysisWindow(self)
 
     def use_folder_file(self, path: Path) -> None:
         self.set_input_file(path)
@@ -994,6 +1000,249 @@ class App(RootWindow):
         self.log.insert("end", text)
         self.log.see("end")
         self.log.configure(state="disabled")
+
+
+class BdmvAnalysisWindow(tk.Toplevel):
+    """Playlist inventory and a proportional clip timeline from bdpl's JSON."""
+
+    def __init__(self, app: App) -> None:
+        super().__init__(app)
+        self.title("BDMV 構造解析 (bdpl)")
+        self.geometry("1050x650")
+        self.minsize(800, 450)
+        self.folder = tk.StringVar(self)
+        current = Path(app.vars["input"].get().strip()).expanduser()
+        if current.is_file():
+            self.folder.set(str(current.parent))
+        self.results: queue.Queue[tuple[dict | Exception, Path | None, bool]] = queue.Queue()
+        self.data: dict | None = None
+        self.mounted_iso: tuple[Path, bool] | None = None
+        self.running = False
+        self.close_requested = False
+        root = ttk.Frame(self, padding=12)
+        root.pack(fill="both", expand=True)
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(2, weight=1)
+        ttk.Entry(root, textvariable=self.folder).grid(row=0, column=0, sticky="ew")
+        ttk.Button(root, text="フォルダ…", command=self.choose_folder).grid(row=0, column=1, padx=(6, 0))
+        ttk.Button(root, text="ISO…", command=self.choose_iso).grid(row=0, column=2, padx=(6, 0))
+        self.scan_button = ttk.Button(root, text="簡易解析", command=lambda: self.start_scan(False))
+        self.scan_button.grid(row=0, column=3, padx=(6, 0))
+        self.deep_button = ttk.Button(root, text="詳細解析 (bdpl)", command=lambda: self.start_scan(True))
+        self.deep_button.grid(row=0, column=4, padx=(6, 0))
+        self.status = ttk.Label(root, text="BDMVフォルダ、その親、またはISOを指定してください。")
+        self.status.grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 8))
+        self.tree = ttk.Treeview(root, columns=("duration", "kind", "details"), show="tree headings")
+        self.tree.heading("#0", text="タイトル / プレイリスト / クリップ")
+        self.tree.heading("duration", text="長さ")
+        self.tree.heading("kind", text="種類")
+        self.tree.heading("details", text="詳細")
+        self.tree.column("#0", width=310)
+        self.tree.column("duration", width=90, stretch=False)
+        self.tree.column("kind", width=120, stretch=False)
+        self.tree.column("details", width=420)
+        self.tree.grid(row=2, column=0, columnspan=4, sticky="nsew")
+        scroll = ttk.Scrollbar(root, orient="vertical", command=self.tree.yview)
+        scroll.grid(row=2, column=4, sticky="ns")
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.bind("<<TreeviewSelect>>", self.draw_selected)
+        ttk.Label(root, text="選択したプレイリストのクリップ構成（時間比）").grid(row=3, column=0, sticky="w", pady=(10, 3))
+        self.timeline = tk.Canvas(root, height=85, background="white", highlightthickness=1)
+        self.timeline.grid(row=4, column=0, columnspan=5, sticky="ew")
+        self.timeline.bind("<Configure>", self.draw_selected)
+        self.item_playlists: dict[str, dict] = {}
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.after(100, self.poll_results)
+
+    def choose_folder(self) -> None:
+        path = filedialog.askdirectory(parent=self)
+        if path:
+            self.folder.set(path)
+
+    def choose_iso(self) -> None:
+        path = filedialog.askopenfilename(parent=self, filetypes=[("Blu-ray ISO", "*.iso"), ("All files", "*.*")])
+        if path:
+            self.folder.set(path)
+
+    def start_scan(self, detailed: bool = False) -> None:
+        if self.running:
+            return
+        path = Path(self.folder.get().strip()).expanduser()
+        if self.mounted_iso and path.resolve() != self.mounted_iso[0]:
+            self.release_iso()
+        self.running = True
+        self.scan_button.configure(state="disabled")
+        self.deep_button.configure(state="disabled")
+        self.status.configure(text="詳細解析中…" if detailed else "簡易解析中…")
+        threading.Thread(target=self.scan_worker, args=(path, detailed), daemon=True).start()
+
+    def scan_worker(self, path: Path, detailed: bool) -> None:
+        iso = None
+        created = False
+        try:
+            if path.suffix.lower() == ".iso":
+                iso = path.resolve()
+                if self.mounted_iso and self.mounted_iso[0] == iso:
+                    drive, _ = mount_iso(iso)
+                else:
+                    drive, created = mount_iso(iso)
+                path = drive
+            if detailed:
+                try:
+                    result = scan_bdmv(path)
+                    result["text_candidates"] = collect_text_candidates(path)
+                except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+                    result = quick_scan_bdmv(path)
+                    result["scan_error"] = str(exc)
+            else:
+                result = quick_scan_bdmv(path)
+            self.results.put((result, iso, created))
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            self.results.put((exc, iso, created))
+
+    def poll_results(self) -> None:
+        if not self.winfo_exists():
+            return
+        try:
+            while True:
+                result, iso, created = self.results.get_nowait()
+                self.running = False
+                if iso:
+                    owned = created or (self.mounted_iso is not None and self.mounted_iso[0] == iso and self.mounted_iso[1])
+                    self.mounted_iso = (iso, owned)
+                self.scan_button.configure(state="normal")
+                self.deep_button.configure(state="normal")
+                if self.close_requested:
+                    self.release_iso()
+                    self.destroy()
+                    return
+                if isinstance(result, Exception):
+                    self.status.configure(text=str(result))
+                else:
+                    self.show_analysis(result)
+        except queue.Empty:
+            pass
+        self.after(100, self.poll_results)
+
+    def release_iso(self) -> None:
+        if self.mounted_iso and self.mounted_iso[1]:
+            try:
+                unmount_iso(self.mounted_iso[0])
+            except OSError as exc:
+                messagebox.showwarning("ISOのマウント解除", str(exc), parent=self)
+        self.mounted_iso = None
+
+    def close(self) -> None:
+        if self.running:
+            self.close_requested = True
+            self.status.configure(text="解析の終了を待ってISOを解除しています…")
+            return
+        self.release_iso()
+        self.destroy()
+
+    def show_analysis(self, data: dict) -> None:
+        self.data = data
+        existing = self.tree.get_children()
+        if existing:
+            self.tree.delete(*existing)
+        self.item_playlists.clear()
+        self.timeline.delete("all")
+        playlists = {item.get("mpls"): item for item in data["playlists"]}
+        links = title_playlist_links(data)
+        if links:
+            titles = self.tree.insert("", "end", text=f"ディスクのタイトル ({len(set(title for title, _ in links))})", open=True)
+            title_nodes = {}
+            for title, name in links:
+                if title not in title_nodes:
+                    title_nodes[title] = self.tree.insert(titles, "end", text=f"タイトル {title}", open=True,
+                                                          values=("", "ナビゲーション", "index.bdmv → MovieObject.bdmv"))
+                playlist = playlists.get(name)
+                item = self.tree.insert(title_nodes[title], "end", text=name,
+                                        values=(duration_text(playlist.get("duration_ms")) if playlist else "—",
+                                                "プレイリスト", "参照先" if playlist else "解析結果にない参照先"))
+                if playlist:
+                    self.item_playlists[item] = playlist
+                    for clip in playlist.get("play_items", []):
+                        self.tree.insert(item, "end", text=clip.get("m2ts") or clip.get("clip_id", "—"),
+                                         values=(duration_text(clip.get("duration_ms")), "クリップ", clip.get("label") or ""))
+        episodes = self.tree.insert("", "end", text=f"エピソード ({len(data.get('episodes', []))})", open=True)
+        for episode in data.get("episodes", []):
+            name = episode.get("playlist", "—")
+            item = self.tree.insert(episodes, "end", text=f"第{episode.get('episode', '?')}話  {name}",
+                                    values=(duration_text(episode.get("duration_ms")), "エピソード",
+                                            f"確信度 {episode.get('confidence', '—')}"))
+            view = episode_timeline(episode)
+            if view["play_items"]:
+                self.item_playlists[item] = view
+                for segment in view["play_items"]:
+                    self.tree.insert(item, "end", text=segment["m2ts"],
+                                     values=(duration_text(segment.get("duration_ms")),
+                                             segment.get("label") or "区間", "推定エピソード内の区間"))
+        inventory = self.tree.insert("", "end", text=f"プレイリスト ({len(playlists)})", open=True)
+        for playlist in data["playlists"]:
+            name = playlist.get("mpls", "—")
+            item = self.tree.insert(inventory, "end", text=name,
+                                    values=(duration_text(playlist.get("duration_ms")), "プレイリスト",
+                                            f"{len(playlist.get('play_items', []))}クリップ / {len(playlist.get('chapters', []))}チャプター"))
+            self.item_playlists[item] = playlist
+            for clip in playlist.get("play_items", []):
+                streams = ", ".join(f"{s.get('codec', '?')} {s.get('lang', '')}".strip()
+                                     for s in clip.get("streams", []))
+                self.tree.insert(item, "end", text=clip.get("m2ts") or clip.get("clip_id", "—"),
+                                 values=(duration_text(clip.get("duration_ms")), clip.get("label") or "クリップ", streams))
+            for chapter_number, position in chapter_positions(playlist):
+                self.tree.insert(item, "end", text=f"チャプター {chapter_number}",
+                                 values=(duration_text(position), "チャプター", "プレイリスト先頭からの位置"))
+        warnings = data.get("warnings", [])
+        if warnings:
+            parent = self.tree.insert("", "end", text=f"警告 ({len(warnings)})", open=True)
+            for warning in warnings:
+                self.tree.insert(parent, "end", text=warning.get("code", "警告"),
+                                 values=("", "警告", warning.get("message", "")))
+        texts = data.get("text_candidates", [])
+        if texts:
+            parent = self.tree.insert("", "end", text=f"文字候補 ({len(texts)})", open=True,
+                                      values=("", "静的抽出", "話数・ボタンとの対応は未確定"))
+            for entry in texts:
+                self.tree.insert(parent, "end", text=entry["text"],
+                                 values=("", "文字候補", entry["source"]))
+        title = (data.get("disc") or {}).get("title") or "タイトル不明"
+        summary = f"{title} ・ {len(playlists)}プレイリスト ・ {len(data.get('episodes', []))}エピソード ・ 文字候補 {len(texts)}件"
+        if data.get("scan_mode") == "quick":
+            summary = f"簡易解析 ・ {title} ・ {len(playlists)}プレイリスト ・ 文字候補 {len(texts)}件（話数・長さは詳細解析で表示）"
+        if data.get("scan_error"):
+            summary += f"（bdpl解析不可: {data['scan_error']}）"
+        self.status.configure(text=summary)
+
+    def draw_selected(self, _event=None) -> None:
+        self.timeline.delete("all")
+        selection = self.tree.selection()
+        playlist = self.item_playlists.get(selection[0]) if selection else None
+        if playlist is None and selection:
+            playlist = self.item_playlists.get(self.tree.parent(selection[0]))
+        if not playlist:
+            return
+        clips = playlist.get("play_items", [])
+        total = sum(max(0, clip.get("duration_ms") or 0) for clip in clips)
+        if total <= 0:
+            return
+        width = max(1, self.timeline.winfo_width() - 20)
+        offset = 10.0
+        colors = {"OP": "#72b7b2", "BODY": "#4c78a8", "ED": "#f2cf5b", "PREVIEW": "#f28e2b"}
+        for clip in clips:
+            span = width * max(0, clip.get("duration_ms") or 0) / total
+            label = str(clip.get("label") or "クリップ").upper()
+            color = colors.get(label, "#9d9da3")
+            self.timeline.create_rectangle(offset, 8, offset + span, 46, fill=color, outline="white")
+            if span > 65:
+                self.timeline.create_text(offset + span / 2, 27, text=label, fill="white")
+            offset += span
+        for chapter_number, position in chapter_positions(playlist):
+            x = 10 + width * min(1.0, position / total)
+            self.timeline.create_line(x, 5, x, 51, fill="#b22222", width=2)
+            self.timeline.create_text(x + 2, 53, text=str(chapter_number), anchor="nw", fill="#b22222")
+        self.timeline.create_text(10, 65, text="0:00", anchor="w")
+        self.timeline.create_text(width + 10, 65, text=duration_text(total), anchor="e")
 
 
 class FolderProbeWindow(tk.Toplevel):
